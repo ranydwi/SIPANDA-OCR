@@ -820,7 +820,7 @@ def process_for_type(file_bytes: bytes, filename: str, target: str, debug: bool=
             st.write("SKPN strong headers:", strong_headers)
 
         # ==========================================
-        # 2️⃣ BUILD RANGE TANPA idx_pos (AMAN TOTAL)
+        # 2️⃣ BUILD RANGE TANPA idx_pos
         # ==========================================
         for i in range(len(strong_headers)):
             start = strong_headers[i]
@@ -843,7 +843,7 @@ def process_for_type(file_bytes: bytes, filename: str, target: str, debug: bool=
             doc_ranges.append((start, end))
 
         # ==================================
-        # 3️⃣ FALLBACK SEQUENTIAL (JIKA GAGAL)
+        # 3️⃣ FALLBACK SEQUENTIAL
         # ==================================
         if not doc_ranges:
             i = 0
@@ -979,7 +979,133 @@ def process_for_type(file_bytes: bytes, filename: str, target: str, debug: bool=
 
     return results
 
-             
+def process_sp2dk(file_bytes: bytes, filename: str, debug: bool = False):
+    """
+    SP2DK:
+    - Split berdasarkan KOP surat (Kemenkeu + DJP + Nomor)
+    - 1 KOP = 1 SP2DK
+    - Filename = NOMOR_SURAT_NAMA_WP.pdf
+    """
+
+    reader = PdfReader(BytesIO(file_bytes))
+    total_pages = len(reader.pages)
+    if total_pages == 0:
+        return []
+
+    images = render_all_pages(file_bytes, total_pages, dpi=OCR_DPI)
+
+    # =========================
+    # 1️⃣ OCR HEADER TIAP HALAMAN
+    # =========================
+    headers = []
+    for i in range(total_pages):
+        img = images[i]
+        if img is None:
+            headers.append("")
+            continue
+
+        h_crop = img.crop((0, 0, img.width, int(img.height * 0.35)))
+        txt = ocr_image(h_crop, config="--psm 6") or ""
+        headers.append(txt)
+
+        if debug:
+            st.text(f"[SP2DK] HEADER PAGE {i+1}")
+            st.code(txt[:500])
+
+    # =========================
+    # 2️⃣ DETEKSI HALAMAN KOP
+    # =========================
+    kop_pages = []
+    for i, h in enumerate(headers):
+        t = h.lower()
+        if (
+            "kementerian keuangan" in t
+            and "direktorat jenderal pajak" in t
+            and "nomor" in t
+        ):
+            kop_pages.append(i)
+
+    if debug:
+        st.success(f"KOP SP2DK ditemukan di halaman: {kop_pages}")
+
+    if not kop_pages:
+        return []
+
+    # =========================
+    # 3️⃣ BENTUK RANGE DOKUMEN
+    # =========================
+    doc_ranges = []
+    for idx, start in enumerate(kop_pages):
+        end = kop_pages[idx + 1] - 1 if idx + 1 < len(kop_pages) else total_pages - 1
+        doc_ranges.append((start, end))
+
+    # =========================
+    # 4️⃣ PROSES PER SP2DK
+    # =========================
+    results = []
+
+    for start, end in doc_ranges:
+        pages = list(range(start, end + 1))
+        out_bytes = pages_to_pdf(reader, pages)
+
+        text = headers[start]
+
+        # ---------------------
+        # EKSTRAK NOMOR SURAT
+        # ---------------------
+        nomor = None
+        for line in text.splitlines():
+            if "nomor" in line.lower():
+                m = re.search(
+                    r'(S[-–][0-9]+[\/A-Z0-9\.]+\/[0-9]{4})',
+                    line,
+                    flags=re.IGNORECASE
+                )
+                if m:
+                    nomor = m.group(1)
+                    break
+
+        if nomor:
+            nomor = (
+                nomor.replace("/", ".")
+                     .replace("–", "-")
+                     .strip()
+            )
+        else:
+            nomor = FALLBACK_NAME
+
+        # ---------------------
+        # EKSTRAK NAMA WP (SETELAH YTH.)
+        # ---------------------
+        nama_wp = None
+        for line in text.splitlines():
+            if line.strip().lower().startswith("yth"):
+                nama_wp = (
+                    line.replace("Yth.", "")
+                        .replace("Yth", "")
+                        .strip()
+                )
+                break
+
+        if nama_wp:
+            nama_wp = re.sub(r'[\\/:"*?<>|]+', '', nama_wp)
+            nama_wp = re.sub(r'\s+', '_', nama_wp).upper()
+
+        # ---------------------
+        # FINAL FILENAME
+        # ---------------------
+        if nama_wp and nama_wp != FALLBACK_NAME:
+            final_name = f"{nomor}_{nama_wp}.pdf"
+        else:
+            final_name = f"{nomor}.pdf"
+
+        results.append((final_name, out_bytes))
+
+        if debug:
+            st.info(f"SP2DK dibuat: {final_name}")
+
+    return results
+
 # ---------------------------------------------------------------------------------
 # ---------------- Streamlit UI (header + sidebar + tabs) -------------------------
 # =========================
@@ -1001,7 +1127,7 @@ st.markdown("""
     <style>
         /* ===== LOGOUT BUTTON ===== */ 
         /* Sidebar background */
-        section[data-testid="stSidebar"] {
+        section[data-testid="stSidebar"] {S
             background-color: #002b5c !important;
             padding-top: 20px;
         }
@@ -1266,7 +1392,7 @@ debug = st.session_state.get("debug_sidebar", False)
 
 # Tabs (Overview + types)
 
-tabs = st.tabs(["Overview","STP","SKPKB","SKPLB","SKPN"])
+tabs = st.tabs(["Overview","STP","SKPKB","SKPLB","SKPN", "SP2DK"])
 
 # Overview tab
 with tabs[0]:
@@ -1521,4 +1647,70 @@ with tabs[4]:
                     z.writestr(name,bts)
             buf.seek(0)
             st.download_button("Download ZIP (SKPN)", buf, file_name="skpn_results.zip")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# SP2DK
+# SP2DK tab
+with tabs[5]:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.header("Mode: Surat Permintaan Penjelasan atas Data dan/atau Keterangan (SP2DK)")
+    st.markdown("""
+    <div style="border-left:5px solid #FFD200; padding:12px; background-color:#fff8e5">
+    <b>📄 Spesifikasi Otomatisasi:</b>
+    <ul>
+    <li>1 file = 1 SP2DK</li>
+    <li>Penamaan berdasarkan Nomor SP2DK dan Nama Wajib Pajak</li>
+    <li>Tidak dilakukan pemisahan halaman</li>
+    </ul>
+
+    <b>⚠️ Pastikan:</b>
+    <ul>
+    <li>Nomor dan Nama WP di SP2DK terlihat jelas</li>
+    </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("#### Upload PDF(s) untuk SP2DK")
+
+    uploaded = st.file_uploader(
+        "Upload",
+        type="pdf",
+        accept_multiple_files=True,
+        key="sp2dk_up",
+        label_visibility="collapsed"
+    )
+
+    if uploaded:
+        all_out = []
+        prog = st.progress(0)
+
+        for i, f in enumerate(uploaded):
+            b = f.read()
+            try:
+                parts = process_sp2dk(b, f.name, debug=debug)
+                all_out.extend(parts)
+                st.success(f"{len(parts)} file diproses dari {f.name}")
+            except Exception as e:
+                st.error(f"Error processing {f.name}: {e}")
+
+            prog.progress(int((i + 1) / len(uploaded) * 100))
+
+        if all_out:
+            st.subheader("Generated files:")
+            for name, _ in all_out:
+                st.write("-", name)
+
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                for name, bts in all_out:
+                    z.writestr(name, bts)
+
+            buf.seek(0)
+            st.download_button(
+                "Download ZIP (SP2DK)",
+                buf,
+                file_name="sp2dk_results.zip"
+            )
+
     st.markdown("</div>", unsafe_allow_html=True)
